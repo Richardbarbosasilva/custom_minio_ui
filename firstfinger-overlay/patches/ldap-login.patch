@@ -87,10 +87,102 @@ index 8ec646d..d2e429c 100644
  	if err != nil {
  		if xnet.IsNetworkOrHostDown(err, true) {
  			return nil, ErrorWithContext(ctx, ErrNetworkError)
+diff --git a/api/user_session.go b/api/user_session.go
+index 4c98bd1..ebe9af4 100644
+--- a/api/user_session.go
++++ b/api/user_session.go
+@@ -64,6 +64,19 @@ func getClaimsFromToken(sessionToken string) (map[string]interface{}, error) {
+ 	return claims, nil
+ }
+ 
++func isLDAPSessionClaims(claims map[string]interface{}) bool {
++	if claims == nil {
++		return false
++	}
++	if _, ok := claims["ldapUser"]; ok {
++		return true
++	}
++	if _, ok := claims["ldapUsername"]; ok {
++		return true
++	}
++	return false
++}
++
+ // getSessionResponse parse the token of the current session and returns a list of allowed actions to render in the UI
+ func getSessionResponse(ctx context.Context, session *models.Principal) (*models.SessionResponse, *CodedAPIError) {
+ 	ctx, cancel := context.WithCancel(ctx)
+@@ -250,6 +263,9 @@ func getSessionResponse(ctx context.Context, session *models.Principal) (*models
+ 		EnvConstants:    &envConstants,
+ 		ServerEndPoint:  getMinIOServer(),
+ 	}
++	if isLDAPSessionClaims(claims) {
++		sessionResp.Features = append(sessionResp.Features, "ldap-session")
++	}
+ 	return sessionResp, nil
+ }
+ 
+diff --git a/api/user_session_test.go b/api/user_session_test.go
+index 5874d4b..93da96c 100644
+--- a/api/user_session_test.go
++++ b/api/user_session_test.go
+@@ -139,3 +139,44 @@ func Test_getListOfEnabledFeatures(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func Test_isLDAPSessionClaims(t *testing.T) {
++	tests := []struct {
++		name   string
++		claims map[string]interface{}
++		want   bool
++	}{
++		{
++			name:   "nil claims",
++			claims: nil,
++			want:   false,
++		},
++		{
++			name: "ldap user claim",
++			claims: map[string]interface{}{
++				"ldapUser": "CN=Richard Barbosa Silva,OU=Wiretest,OU=Testing,OU=CLICKIP,DC=clickip,DC=local",
++			},
++			want: true,
++		},
++		{
++			name: "ldap username claim",
++			claims: map[string]interface{}{
++				"ldapUsername": "richard.silva",
++			},
++			want: true,
++		},
++		{
++			name: "non ldap claims",
++			claims: map[string]interface{}{
++				"accessKey": "richard.silva",
++			},
++			want: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(_ *testing.T) {
++			assert.Equal(t, tt.want, isLDAPSessionClaims(tt.claims))
++		})
++	}
++}
 diff --git a/web-app/src/screens/Console/Account/Account.tsx b/web-app/src/screens/Console/Account/Account.tsx
-index b9ac00c..617eae9 100644
+index b9ac00c..95b5024 100644
 --- a/web-app/src/screens/Console/Account/Account.tsx
 +++ b/web-app/src/screens/Console/Account/Account.tsx
+@@ -84,7 +84,7 @@ const Account = () => {
+   const [deleteMultipleOpen, setDeleteMultipleOpen] = useState<boolean>(false);
+   const [isEditOpen, setIsEditOpen] = useState<boolean>(false);
+ 
+-  const userIDP = (features && features.includes("external-idp")) || false;
++  const userIDP = (features && features.includes("ldap-session")) || false;
+ 
+   useEffect(() => {
+     fetchRecords();
 @@ -278,6 +278,19 @@ const Account = () => {
            </Grid>
  
@@ -159,6 +251,520 @@ index ba8bda8..ccc620c 100644
                      ) : (
                        <Fragment />
                      )}
+diff --git a/web-app/src/screens/Console/Groups/AddGroupScreen.tsx b/web-app/src/screens/Console/Groups/AddGroupScreen.tsx
+index 9ed8452..5931af9 100644
+--- a/web-app/src/screens/Console/Groups/AddGroupScreen.tsx
++++ b/web-app/src/screens/Console/Groups/AddGroupScreen.tsx
+@@ -20,6 +20,7 @@ import { modalStyleUtils } from "../Common/FormComponents/common/styleLibrary";
+ 
+ import {
+   BackLink,
++  Box,
+   Button,
+   CreateGroupIcon,
+   FormLayout,
+@@ -28,6 +29,7 @@ import {
+   PageLayout,
+   ProgressBar,
+ } from "mds";
++import { useSelector } from "react-redux";
+ import { api } from "api";
+ import { errorToHandler } from "api/errors";
+ import { IAM_PAGES } from "../../../common/SecureComponent/permissions";
+@@ -37,6 +39,7 @@ import AddGroupHelpBox from "./AddGroupHelpBox";
+ import UsersSelectors from "./UsersSelectors";
+ import PageHeaderWrapper from "../Common/PageHeaderWrapper/PageHeaderWrapper";
+ import HelpMenu from "../HelpMenu";
++import { AppState } from "../../../store";
+ 
+ const AddGroupScreen = () => {
+   const dispatch = useAppDispatch();
+@@ -45,6 +48,10 @@ const AddGroupScreen = () => {
+   const [saving, isSaving] = useState<boolean>(false);
+   const [selectedUsers, setSelectedUsers] = useState<string[]>([]);
+   const [validGroup, setValidGroup] = useState<boolean>(false);
++  const features = useSelector(
++    (state: AppState) => state.console.session.features || [],
++  );
++  const ldapSession = features.includes("ldap-session");
+ 
+   useEffect(() => {
+     setValidGroup(groupName.trim() !== "");
+@@ -101,51 +108,59 @@ const AddGroupScreen = () => {
+         actions={<HelpMenu />}
+       />
+       <PageLayout>
+-        <FormLayout
+-          title={"Create Group"}
+-          icon={<CreateGroupIcon />}
+-          helpBox={<AddGroupHelpBox />}
+-        >
+-          <form noValidate autoComplete="off" onSubmit={setSaving}>
+-            <InputBox
+-              id="group-name"
+-              name="group-name"
+-              label="Group Name"
+-              autoFocus={true}
+-              value={groupName}
+-              onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+-                setGroupName(e.target.value);
+-              }}
+-            />
+-            <UsersSelectors
+-              selectedUsers={selectedUsers}
+-              setSelectedUsers={setSelectedUsers}
+-              editMode={true}
+-            />
+-            <Grid item xs={12} sx={modalStyleUtils.modalButtonBar}>
+-              <Button
+-                id={"clear-group"}
+-                type="button"
+-                variant="regular"
+-                onClick={resetForm}
+-                label={"Clear"}
++        {ldapSession ? (
++          <Box withBorders sx={{ padding: 18, color: "#d1d5db" }}>
++            Local MinIO groups can only be created from a local built-in admin
++            session. This LDAP session can review groups, but it cannot create
++            or modify them.
++          </Box>
++        ) : (
++          <FormLayout
++            title={"Create Group"}
++            icon={<CreateGroupIcon />}
++            helpBox={<AddGroupHelpBox />}
++          >
++            <form noValidate autoComplete="off" onSubmit={setSaving}>
++              <InputBox
++                id="group-name"
++                name="group-name"
++                label="Group Name"
++                autoFocus={true}
++                value={groupName}
++                onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
++                  setGroupName(e.target.value);
++                }}
+               />
+-
+-              <Button
+-                id={"save-group"}
+-                type="submit"
+-                variant="callAction"
+-                disabled={saving || !validGroup}
+-                label={"Save"}
++              <UsersSelectors
++                selectedUsers={selectedUsers}
++                setSelectedUsers={setSelectedUsers}
++                editMode={true}
+               />
+-            </Grid>
+-            {saving && (
+-              <Grid item xs={12}>
+-                <ProgressBar />
++              <Grid item xs={12} sx={modalStyleUtils.modalButtonBar}>
++                <Button
++                  id={"clear-group"}
++                  type="button"
++                  variant="regular"
++                  onClick={resetForm}
++                  label={"Clear"}
++                />
++
++                <Button
++                  id={"save-group"}
++                  type="submit"
++                  variant="callAction"
++                  disabled={saving || !validGroup}
++                  label={"Save"}
++                />
+               </Grid>
+-            )}
+-          </form>
+-        </FormLayout>
++              {saving && (
++                <Grid item xs={12}>
++                  <ProgressBar />
++                </Grid>
++              )}
++            </form>
++          </FormLayout>
++        )}
+       </PageLayout>
+     </Fragment>
+   );
+diff --git a/web-app/src/screens/Console/Groups/Groups.tsx b/web-app/src/screens/Console/Groups/Groups.tsx
+index 82d8f50..d9917b3 100644
+--- a/web-app/src/screens/Console/Groups/Groups.tsx
++++ b/web-app/src/screens/Console/Groups/Groups.tsx
+@@ -31,6 +31,7 @@ import {
+   ProgressBar,
+   ActionLink,
+ } from "mds";
++import { useSelector } from "react-redux";
+ 
+ import { api } from "api";
+ import { stringSort } from "../../../utils/sortFunctions";
+@@ -57,6 +58,7 @@ import TooltipWrapper from "../Common/TooltipWrapper/TooltipWrapper";
+ import PageHeaderWrapper from "../Common/PageHeaderWrapper/PageHeaderWrapper";
+ import HelpMenu from "../HelpMenu";
+ import SearchBox from "../Common/SearchBox";
++import { selFeatures } from "../consoleSlice";
+ 
+ const DeleteGroup = withSuspense(React.lazy(() => import("./DeleteGroup")));
+ const SetPolicy = withSuspense(
+@@ -66,6 +68,7 @@ const SetPolicy = withSuspense(
+ const Groups = () => {
+   const dispatch = useAppDispatch();
+   const navigate = useNavigate();
++  const features = useSelector(selFeatures);
+ 
+   const [deleteOpen, setDeleteOpen] = useState<boolean>(false);
+   const [loading, isLoading] = useState<boolean>(false);
+@@ -73,6 +76,7 @@ const Groups = () => {
+   const [filter, setFilter] = useState<string>("");
+   const [policyOpen, setPolicyOpen] = useState<boolean>(false);
+   const [checkedGroups, setCheckedGroups] = useState<string[]>([]);
++  const ldapSession = !!features?.includes("ldap-session");
+ 
+   useEffect(() => {
+     isLoading(true);
+@@ -219,89 +223,105 @@ const Groups = () => {
+                 display: "flex",
+               }}
+             >
+-              <SecureComponent
+-                resource={CONSOLE_UI_RESOURCE}
+-                scopes={applyPolicyPermissions}
+-                matchAll
+-                errorProps={{ disabled: true }}
+-              >
+-                <TooltipWrapper
+-                  tooltip={
+-                    checkedGroups.length < 1
+-                      ? "Please select Groups on which you want to apply Policies"
+-                      : applyPolicy
+-                        ? "Select Policy"
+-                        : permissionTooltipHelper(
+-                            applyPolicyPermissions,
+-                            "apply policies to Groups",
+-                          )
+-                  }
+-                >
+-                  <Button
+-                    id={"assign-policy"}
+-                    onClick={() => {
+-                      setPolicyOpen(true);
+-                    }}
+-                    label={"Assign Policy"}
+-                    icon={<IAMPoliciesIcon />}
+-                    disabled={checkedGroups.length < 1 || !applyPolicy}
+-                    variant={"regular"}
+-                  />
+-                </TooltipWrapper>
+-              </SecureComponent>
+-              <SecureComponent
+-                resource={CONSOLE_UI_RESOURCE}
+-                scopes={deleteGroupPermissions}
+-                matchAll
+-                errorProps={{ disabled: true }}
+-              >
+-                <TooltipWrapper
+-                  tooltip={
+-                    checkedGroups.length === 0
+-                      ? "Select Groups to delete"
+-                      : getGroup
+-                        ? "Delete Selected"
+-                        : permissionTooltipHelper(
+-                            getGroupPermissions,
+-                            "delete Groups",
+-                          )
+-                  }
+-                >
+-                  <Button
+-                    id="delete-selected-groups"
+-                    onClick={() => {
+-                      setDeleteOpen(true);
+-                    }}
+-                    label={"Delete Selected"}
+-                    icon={<DeleteIcon />}
+-                    variant="secondary"
+-                    disabled={checkedGroups.length === 0 || !getGroup}
+-                  />
+-                </TooltipWrapper>
+-              </SecureComponent>
+-              <SecureComponent
+-                resource={CONSOLE_UI_RESOURCE}
+-                scopes={createGroupPermissions}
+-                matchAll
+-                errorProps={{ disabled: true }}
+-              >
+-                <TooltipWrapper tooltip={"Create Group"}>
+-                  <Button
+-                    id={"create-group"}
+-                    label={"Create Group"}
+-                    variant="callAction"
+-                    icon={<AddIcon />}
+-                    onClick={() => {
+-                      navigate(`${IAM_PAGES.GROUPS_ADD}`);
+-                    }}
+-                  />
+-                </TooltipWrapper>
+-              </SecureComponent>
++              {!ldapSession && (
++                <Fragment>
++                  <SecureComponent
++                    resource={CONSOLE_UI_RESOURCE}
++                    scopes={applyPolicyPermissions}
++                    matchAll
++                    errorProps={{ disabled: true }}
++                  >
++                    <TooltipWrapper
++                      tooltip={
++                        checkedGroups.length < 1
++                          ? "Please select Groups on which you want to apply Policies"
++                          : applyPolicy
++                            ? "Select Policy"
++                            : permissionTooltipHelper(
++                                applyPolicyPermissions,
++                                "apply policies to Groups",
++                              )
++                      }
++                    >
++                      <Button
++                        id={"assign-policy"}
++                        onClick={() => {
++                          setPolicyOpen(true);
++                        }}
++                        label={"Assign Policy"}
++                        icon={<IAMPoliciesIcon />}
++                        disabled={checkedGroups.length < 1 || !applyPolicy}
++                        variant={"regular"}
++                      />
++                    </TooltipWrapper>
++                  </SecureComponent>
++                  <SecureComponent
++                    resource={CONSOLE_UI_RESOURCE}
++                    scopes={deleteGroupPermissions}
++                    matchAll
++                    errorProps={{ disabled: true }}
++                  >
++                    <TooltipWrapper
++                      tooltip={
++                        checkedGroups.length === 0
++                          ? "Select Groups to delete"
++                          : getGroup
++                            ? "Delete Selected"
++                            : permissionTooltipHelper(
++                                getGroupPermissions,
++                                "delete Groups",
++                              )
++                      }
++                    >
++                      <Button
++                        id="delete-selected-groups"
++                        onClick={() => {
++                          setDeleteOpen(true);
++                        }}
++                        label={"Delete Selected"}
++                        icon={<DeleteIcon />}
++                        variant="secondary"
++                        disabled={checkedGroups.length === 0 || !getGroup}
++                      />
++                    </TooltipWrapper>
++                  </SecureComponent>
++                  <SecureComponent
++                    resource={CONSOLE_UI_RESOURCE}
++                    scopes={createGroupPermissions}
++                    matchAll
++                    errorProps={{ disabled: true }}
++                  >
++                    <TooltipWrapper tooltip={"Create Group"}>
++                      <Button
++                        id={"create-group"}
++                        label={"Create Group"}
++                        variant="callAction"
++                        icon={<AddIcon />}
++                        onClick={() => {
++                          navigate(`${IAM_PAGES.GROUPS_ADD}`);
++                        }}
++                      />
++                    </TooltipWrapper>
++                  </SecureComponent>
++                </Fragment>
++              )}
+             </Box>
+           </Grid>
+           {loading && <ProgressBar />}
+           {!loading && (
+             <Fragment>
++              {ldapSession && (
++                <Grid item xs={12}>
++                  <Box
++                    withBorders
++                    sx={{ marginBottom: 15, padding: 15, color: "#d1d5db" }}
++                  >
++                    LDAP sessions can review local groups, but MinIO only
++                    allows creating, deleting, or changing them from a local
++                    built-in admin session.
++                  </Box>
++                </Grid>
++              )}
+               {records.length > 0 && (
+                 <Fragment>
+                   <Grid item xs={12} sx={{ marginBottom: 15 }}>
+@@ -316,7 +336,9 @@ const Groups = () => {
+                         isLoading={loading}
+                         selectedItems={checkedGroups}
+                         onSelect={
+-                          deleteGroup || getGroup ? selectionChanged : undefined
++                          !ldapSession && (deleteGroup || applyPolicy)
++                            ? selectionChanged
++                            : undefined
+                         }
+                         records={filteredRecords}
+                         entityName="Groups"
+diff --git a/web-app/src/screens/Console/Groups/GroupsDetails.tsx b/web-app/src/screens/Console/Groups/GroupsDetails.tsx
+index fd9ba0c..09966c1 100644
+--- a/web-app/src/screens/Console/Groups/GroupsDetails.tsx
++++ b/web-app/src/screens/Console/Groups/GroupsDetails.tsx
+@@ -16,6 +16,7 @@
+ 
+ import React, { Fragment, useEffect, useState } from "react";
+ import { useNavigate, useParams } from "react-router-dom";
++import { useSelector } from "react-redux";
+ import {
+   AddIcon,
+   BackLink,
+@@ -63,6 +64,7 @@ import SearchBox from "../Common/SearchBox";
+ import TooltipWrapper from "../Common/TooltipWrapper/TooltipWrapper";
+ import HelpMenu from "../HelpMenu";
+ import PageHeaderWrapper from "../Common/PageHeaderWrapper/PageHeaderWrapper";
++import { selFeatures } from "../consoleSlice";
+ 
+ const formatPolicy = (policy: string = ""): string[] => {
+   if (policy.length <= 0) return [];
+@@ -73,6 +75,7 @@ const GroupsDetails = () => {
+   const dispatch = useAppDispatch();
+   const navigate = useNavigate();
+   const params = useParams();
++  const features = useSelector(selFeatures);
+ 
+   const [groupDetails, setGroupDetails] = useState<Group>({});
+   const [policyOpen, setPolicyOpen] = useState<boolean>(false);
+@@ -80,6 +83,7 @@ const GroupsDetails = () => {
+   const [deleteOpen, setDeleteOpen] = useState<boolean>(false);
+   const [memberFilter, setMemberFilter] = useState<string>("");
+   const [currentTab, setCurrentTab] = useState<string>("members");
++  const ldapSession = !!features?.includes("ldap-session");
+ 
+   const { members = [], policy = "", status: groupEnabled } = groupDetails;
+ 
+@@ -193,7 +197,9 @@ const GroupsDetails = () => {
+             >
+               <TooltipWrapper
+                 tooltip={
+-                  canEditGroupMembers
++                  ldapSession
++                    ? "LDAP sessions cannot modify local group membership."
++                    : canEditGroupMembers
+                     ? memberActionText
+                     : permissionTooltipHelper(
+                         createGroupPermissions,
+@@ -209,7 +215,7 @@ const GroupsDetails = () => {
+                   onClick={() => {
+                     setUsersOpen(true);
+                   }}
+-                  disabled={!canEditGroupMembers}
++                  disabled={ldapSession || !canEditGroupMembers}
+                 />
+               </TooltipWrapper>
+             </SecureComponent>
+@@ -271,7 +277,9 @@ const GroupsDetails = () => {
+           actions={
+             <TooltipWrapper
+               tooltip={
+-                canSetPolicies
++                ldapSession
++                  ? "LDAP sessions cannot modify local group policies."
++                  : canSetPolicies
+                   ? "Set Policies"
+                   : permissionTooltipHelper(
+                       setGroupPoliciesPermissions,
+@@ -287,7 +295,7 @@ const GroupsDetails = () => {
+                 onClick={() => {
+                   setPolicyOpen(true);
+                 }}
+-                disabled={!canSetPolicies}
++                disabled={ldapSession || !canSetPolicies}
+               />
+             </TooltipWrapper>
+           }
+@@ -407,11 +415,13 @@ const GroupsDetails = () => {
+                 </span>
+                 <TooltipWrapper
+                   tooltip={
+-                    hasPermission(
+-                      CONSOLE_UI_RESOURCE,
+-                      enableDisableGroupPermissions,
+-                      true,
+-                    )
++                    ldapSession
++                      ? "LDAP sessions cannot modify local groups."
++                      : hasPermission(
++                            CONSOLE_UI_RESOURCE,
++                            enableDisableGroupPermissions,
++                            true,
++                          )
+                       ? ""
+                       : permissionTooltipHelper(
+                           enableDisableGroupPermissions,
+@@ -435,11 +445,18 @@ const GroupsDetails = () => {
+                         toggleGroupStatus(!isGroupEnabled);
+                       }}
+                       switchOnly
++                      disabled={ldapSession}
+                     />
+                   </SecureComponent>
+                 </TooltipWrapper>
+ 
+-                <TooltipWrapper tooltip={"Delete Group"}>
++                <TooltipWrapper
++                  tooltip={
++                    ldapSession
++                      ? "LDAP sessions cannot delete local groups."
++                      : "Delete Group"
++                  }
++                >
+                   <Button
+                     id={"delete-user-group"}
+                     variant="secondary"
+@@ -447,6 +464,7 @@ const GroupsDetails = () => {
+                     onClick={() => {
+                       setDeleteOpen(true);
+                     }}
++                    disabled={ldapSession}
+                   />
+                 </TooltipWrapper>
+               </Box>
+@@ -454,6 +472,18 @@ const GroupsDetails = () => {
+             sx={{ marginBottom: 15 }}
+           />
+         </Grid>
++        {ldapSession && (
++          <Grid item xs={12}>
++            <Box
++              withBorders
++              sx={{ marginBottom: 15, padding: 15, color: "#d1d5db" }}
++            >
++              This LDAP session is read-only for local group administration.
++              Use a local built-in admin account to change members, policies,
++              status, or deletion of local groups.
++            </Box>
++          </Grid>
++        )}
+ 
+         <Grid item xs={12}>
+           <Tabs
 diff --git a/web-app/src/screens/Console/Policies/PolicyDetails.tsx b/web-app/src/screens/Console/Policies/PolicyDetails.tsx
 index 66de9c2..fd9b83c 100644
 --- a/web-app/src/screens/Console/Policies/PolicyDetails.tsx
@@ -233,6 +839,656 @@ index 66de9c2..fd9b83c 100644
                    id: "groups",
                  },
                  content: (
+diff --git a/web-app/src/screens/Console/Users/AddUserScreen.tsx b/web-app/src/screens/Console/Users/AddUserScreen.tsx
+index 40bdfd8..9a0bf88 100644
+--- a/web-app/src/screens/Console/Users/AddUserScreen.tsx
++++ b/web-app/src/screens/Console/Users/AddUserScreen.tsx
+@@ -17,6 +17,7 @@
+ import React, { Fragment, useEffect } from "react";
+ import {
+   BackLink,
++  Box,
+   Button,
+   CreateUserIcon,
+   FormLayout,
+@@ -62,6 +63,8 @@ const AddUser = () => {
+   const secretKeylength = useSelector(
+     (state: AppState) => state.createUser.secretKeylength,
+   );
++  const features = useSelector((state: AppState) => state.console.session.features || []);
++  const ldapSession = features.includes("ldap-session");
+   const navigate = useNavigate();
+   dispatch(setSendEnabled());
+ 
+@@ -104,55 +107,63 @@ const AddUser = () => {
+           actions={<HelpMenu />}
+         />
+         <PageLayout>
+-          <FormLayout
+-            title={"Create User"}
+-            icon={<CreateUserIcon />}
+-            helpBox={<AddUserHelpBox />}
+-          >
+-            <form
+-              noValidate
+-              autoComplete="off"
+-              onSubmit={(e: React.FormEvent<HTMLFormElement>) => {
+-                saveRecord(e);
+-              }}
++          {ldapSession ? (
++            <Box withBorders sx={{ padding: 18, color: "#d1d5db" }}>
++              Local MinIO users can only be created from a local built-in admin
++              session. This LDAP session is limited to reviewing identities and
++              managing its own access keys.
++            </Box>
++          ) : (
++            <FormLayout
++              title={"Create User"}
++              icon={<CreateUserIcon />}
++              helpBox={<AddUserHelpBox />}
+             >
+-              <UserSelector />
+-              <PasswordSelector />
+-              <PolicySelectors selectedPolicy={selectedPolicies} />
+-              <GroupsSelectors
+-                selectedGroups={selectedGroups}
+-                setSelectedGroups={(elements: string[]) => {
+-                  dispatch(setSelectedGroups(elements));
++              <form
++                noValidate
++                autoComplete="off"
++                onSubmit={(e: React.FormEvent<HTMLFormElement>) => {
++                  saveRecord(e);
+                 }}
+-              />
+-              {addLoading && (
+-                <Grid item xs={12}>
+-                  <ProgressBar />
+-                </Grid>
+-              )}
+-
+-              <Grid item xs={12} sx={modalStyleUtils.modalButtonBar}>
+-                <Button
+-                  id={"clear-add-user"}
+-                  type="button"
+-                  variant="regular"
+-                  onClick={(e) => {
+-                    dispatch(resetFormAsync());
++              >
++                <UserSelector />
++                <PasswordSelector />
++                <PolicySelectors selectedPolicy={selectedPolicies} />
++                <GroupsSelectors
++                  selectedGroups={selectedGroups}
++                  setSelectedGroups={(elements: string[]) => {
++                    dispatch(setSelectedGroups(elements));
+                   }}
+-                  label={"Clear"}
+                 />
++                {addLoading && (
++                  <Grid item xs={12}>
++                    <ProgressBar />
++                  </Grid>
++                )}
+ 
+-                <Button
+-                  id={"save-user"}
+-                  type="submit"
+-                  variant="callAction"
+-                  color="primary"
+-                  disabled={addLoading || !sendEnabled}
+-                  label={"Save"}
+-                />
+-              </Grid>
+-            </form>
+-          </FormLayout>
++                <Grid item xs={12} sx={modalStyleUtils.modalButtonBar}>
++                  <Button
++                    id={"clear-add-user"}
++                    type="button"
++                    variant="regular"
++                    onClick={() => {
++                      dispatch(resetFormAsync());
++                    }}
++                    label={"Clear"}
++                  />
++
++                  <Button
++                    id={"save-user"}
++                    type="submit"
++                    variant="callAction"
++                    color="primary"
++                    disabled={addLoading || !sendEnabled}
++                    label={"Save"}
++                  />
++                </Grid>
++              </form>
++            </FormLayout>
++          )}
+         </PageLayout>
+       </Grid>
+     </Fragment>
+diff --git a/web-app/src/screens/Console/Users/ListUsers.tsx b/web-app/src/screens/Console/Users/ListUsers.tsx
+index ad083e5..ed347df 100644
+--- a/web-app/src/screens/Console/Users/ListUsers.tsx
++++ b/web-app/src/screens/Console/Users/ListUsers.tsx
+@@ -18,6 +18,7 @@ import React, { Fragment, useEffect, useState } from "react";
+ import { useNavigate } from "react-router-dom";
+ import {
+   AddIcon,
++  Box,
+   Button,
+   DeleteIcon,
+   GroupsIcon,
+@@ -29,6 +30,7 @@ import {
+   ProgressBar,
+   ActionLink,
+ } from "mds";
++import { useSelector } from "react-redux";
+ 
+ import { User, UsersList } from "./types";
+ import { usersSort } from "../../../utils/sortFunctions";
+@@ -58,6 +60,7 @@ import { useAppDispatch } from "../../../store";
+ import TooltipWrapper from "../Common/TooltipWrapper/TooltipWrapper";
+ import PageHeaderWrapper from "../Common/PageHeaderWrapper/PageHeaderWrapper";
+ import HelpMenu from "../HelpMenu";
++import { selFeatures } from "../consoleSlice";
+ 
+ const DeleteUser = withSuspense(React.lazy(() => import("./DeleteUser")));
+ const AddToGroup = withSuspense(React.lazy(() => import("./BulkAddToGroup")));
+@@ -65,6 +68,7 @@ const AddToGroup = withSuspense(React.lazy(() => import("./BulkAddToGroup")));
+ const ListUsers = () => {
+   const dispatch = useAppDispatch();
+   const navigate = useNavigate();
++  const features = useSelector(selFeatures);
+ 
+   const [records, setRecords] = useState<User[]>([]);
+   const [loading, setLoading] = useState<boolean>(true);
+@@ -72,6 +76,7 @@ const ListUsers = () => {
+   const [addGroupOpen, setAddGroupOpen] = useState<boolean>(false);
+   const [filter, setFilter] = useState<string>("");
+   const [checkedUsers, setCheckedUsers] = useState<string[]>([]);
++  const ldapSession = !!features?.includes("ldap-session");
+ 
+   const displayListUsers = hasPermission(
+     CONSOLE_UI_RESOURCE,
+@@ -203,130 +208,148 @@ const ListUsers = () => {
+                 maxWidth: 380,
+               }}
+             />
+-            <SecureComponent
+-              resource={CONSOLE_UI_RESOURCE}
+-              scopes={[IAM_SCOPES.ADMIN_DELETE_USER]}
+-              matchAll
+-              errorProps={{ disabled: true }}
+-            >
+-              <TooltipWrapper
+-                tooltip={
+-                  hasPermission("console", [IAM_SCOPES.ADMIN_DELETE_USER])
+-                    ? checkedUsers.length === 0
+-                      ? "Select Users to delete"
+-                      : "Delete Selected"
+-                    : permissionTooltipHelper(
+-                        [IAM_SCOPES.ADMIN_DELETE_USER],
+-                        "delete users",
+-                      )
+-                }
+-              >
+-                <Button
+-                  id={"delete-selected-users"}
+-                  onClick={() => {
+-                    setDeleteOpen(true);
+-                  }}
+-                  label={"Delete Selected"}
+-                  icon={<DeleteIcon />}
+-                  disabled={checkedUsers.length === 0}
+-                  variant={"secondary"}
+-                  aria-label="delete-selected-users"
+-                />
+-              </TooltipWrapper>
+-            </SecureComponent>
+-            <SecureComponent
+-              scopes={[IAM_SCOPES.ADMIN_ADD_USER_TO_GROUP]}
+-              resource={CONSOLE_UI_RESOURCE}
+-              errorProps={{ disabled: true }}
+-            >
+-              <TooltipWrapper
+-                tooltip={
+-                  hasPermission("console", [IAM_SCOPES.ADMIN_ADD_USER_TO_GROUP])
+-                    ? checkedUsers.length === 0
+-                      ? "Select Users to group"
+-                      : "Add to Group"
+-                    : permissionTooltipHelper(
+-                        [IAM_SCOPES.ADMIN_ADD_USER_TO_GROUP],
+-                        "add users to groups",
+-                      )
+-                }
+-              >
+-                <Button
+-                  id={"add-to-group"}
+-                  label={"Add to Group"}
+-                  icon={<GroupsIcon />}
+-                  disabled={checkedUsers.length <= 0}
+-                  onClick={() => {
+-                    if (checkedUsers.length > 0) {
+-                      setAddGroupOpen(true);
++            {!ldapSession && (
++              <Fragment>
++                <SecureComponent
++                  resource={CONSOLE_UI_RESOURCE}
++                  scopes={[IAM_SCOPES.ADMIN_DELETE_USER]}
++                  matchAll
++                  errorProps={{ disabled: true }}
++                >
++                  <TooltipWrapper
++                    tooltip={
++                      hasPermission("console", [IAM_SCOPES.ADMIN_DELETE_USER])
++                        ? checkedUsers.length === 0
++                          ? "Select Users to delete"
++                          : "Delete Selected"
++                        : permissionTooltipHelper(
++                            [IAM_SCOPES.ADMIN_DELETE_USER],
++                            "delete users",
++                          )
++                    }
++                  >
++                    <Button
++                      id={"delete-selected-users"}
++                      onClick={() => {
++                        setDeleteOpen(true);
++                      }}
++                      label={"Delete Selected"}
++                      icon={<DeleteIcon />}
++                      disabled={checkedUsers.length === 0}
++                      variant={"secondary"}
++                      aria-label="delete-selected-users"
++                    />
++                  </TooltipWrapper>
++                </SecureComponent>
++                <SecureComponent
++                  scopes={[IAM_SCOPES.ADMIN_ADD_USER_TO_GROUP]}
++                  resource={CONSOLE_UI_RESOURCE}
++                  errorProps={{ disabled: true }}
++                >
++                  <TooltipWrapper
++                    tooltip={
++                      hasPermission("console", [
++                        IAM_SCOPES.ADMIN_ADD_USER_TO_GROUP,
++                      ])
++                        ? checkedUsers.length === 0
++                          ? "Select Users to group"
++                          : "Add to Group"
++                        : permissionTooltipHelper(
++                            [IAM_SCOPES.ADMIN_ADD_USER_TO_GROUP],
++                            "add users to groups",
++                          )
+                     }
+-                  }}
+-                  variant={"regular"}
+-                />
+-              </TooltipWrapper>
+-            </SecureComponent>
+-            <SecureComponent
+-              scopes={[
+-                IAM_SCOPES.ADMIN_CREATE_USER,
+-                IAM_SCOPES.ADMIN_LIST_USER_POLICIES,
+-                IAM_SCOPES.ADMIN_LIST_GROUPS,
+-              ]}
+-              resource={S3_ALL_RESOURCES}
+-              matchAll
+-              errorProps={{ disabled: true }}
+-            >
+-              <TooltipWrapper
+-                tooltip={
+-                  hasPermission(
+-                    "console-ui",
+-                    [
+-                      IAM_SCOPES.ADMIN_CREATE_USER,
+-                      IAM_SCOPES.ADMIN_LIST_USER_POLICIES,
+-                      IAM_SCOPES.ADMIN_LIST_GROUPS,
+-                      IAM_SCOPES.ADMIN_ATTACH_USER_OR_GROUP_POLICY,
+-                    ],
+-                    true,
+-                  )
+-                    ? "Create User"
+-                    : permissionTooltipHelper(
++                  >
++                    <Button
++                      id={"add-to-group"}
++                      label={"Add to Group"}
++                      icon={<GroupsIcon />}
++                      disabled={checkedUsers.length <= 0}
++                      onClick={() => {
++                        if (checkedUsers.length > 0) {
++                          setAddGroupOpen(true);
++                        }
++                      }}
++                      variant={"regular"}
++                    />
++                  </TooltipWrapper>
++                </SecureComponent>
++                <SecureComponent
++                  scopes={[
++                    IAM_SCOPES.ADMIN_CREATE_USER,
++                    IAM_SCOPES.ADMIN_LIST_USER_POLICIES,
++                    IAM_SCOPES.ADMIN_LIST_GROUPS,
++                  ]}
++                  resource={S3_ALL_RESOURCES}
++                  matchAll
++                  errorProps={{ disabled: true }}
++                >
++                  <TooltipWrapper
++                    tooltip={
++                      hasPermission(
++                        "console-ui",
+                         [
+                           IAM_SCOPES.ADMIN_CREATE_USER,
+                           IAM_SCOPES.ADMIN_LIST_USER_POLICIES,
+                           IAM_SCOPES.ADMIN_LIST_GROUPS,
+                           IAM_SCOPES.ADMIN_ATTACH_USER_OR_GROUP_POLICY,
+                         ],
+-                        "create users",
++                        true,
+                       )
+-                }
+-              >
+-                <Button
+-                  id={"create-user"}
+-                  label={"Create User"}
+-                  icon={<AddIcon />}
+-                  onClick={() => {
+-                    navigate(`${IAM_PAGES.USER_ADD}`);
+-                  }}
+-                  variant={"callAction"}
+-                  disabled={
+-                    !hasPermission(
+-                      "console-ui",
+-                      [
+-                        IAM_SCOPES.ADMIN_CREATE_USER,
+-                        IAM_SCOPES.ADMIN_LIST_USER_POLICIES,
+-                        IAM_SCOPES.ADMIN_LIST_GROUPS,
+-                        IAM_SCOPES.ADMIN_ATTACH_USER_OR_GROUP_POLICY,
+-                      ],
+-                      true,
+-                    )
+-                  }
+-                />
+-              </TooltipWrapper>
+-            </SecureComponent>
++                        ? "Create User"
++                        : permissionTooltipHelper(
++                            [
++                              IAM_SCOPES.ADMIN_CREATE_USER,
++                              IAM_SCOPES.ADMIN_LIST_USER_POLICIES,
++                              IAM_SCOPES.ADMIN_LIST_GROUPS,
++                              IAM_SCOPES.ADMIN_ATTACH_USER_OR_GROUP_POLICY,
++                            ],
++                            "create users",
++                          )
++                    }
++                  >
++                    <Button
++                      id={"create-user"}
++                      label={"Create User"}
++                      icon={<AddIcon />}
++                      onClick={() => {
++                        navigate(`${IAM_PAGES.USER_ADD}`);
++                      }}
++                      variant={"callAction"}
++                      disabled={
++                        !hasPermission(
++                          "console-ui",
++                          [
++                            IAM_SCOPES.ADMIN_CREATE_USER,
++                            IAM_SCOPES.ADMIN_LIST_USER_POLICIES,
++                            IAM_SCOPES.ADMIN_LIST_GROUPS,
++                            IAM_SCOPES.ADMIN_ATTACH_USER_OR_GROUP_POLICY,
++                          ],
++                          true,
++                        )
++                      }
++                    />
++                  </TooltipWrapper>
++                </SecureComponent>
++              </Fragment>
++            )}
+           </Grid>
+ 
+           {loading && <ProgressBar />}
+           {!loading && (
+             <Fragment>
++              {ldapSession && (
++                <Grid item xs={12}>
++                  <Box
++                    withBorders
++                    sx={{ marginBottom: 15, padding: 15, color: "#d1d5db" }}
++                  >
++                    LDAP sessions can review identities, but MinIO only allows
++                    creating or editing local users from a local built-in admin
++                    session.
++                  </Box>
++                </Grid>
++              )}
+               {records.length > 0 && (
+                 <Fragment>
+                   <Grid item xs={12} sx={{ marginBottom: 15 }}>
+@@ -341,7 +364,7 @@ const ListUsers = () => {
+                           { label: "Access Key", elementKey: "accessKey" },
+                         ]}
+                         onSelect={
+-                          addUserToGroup || deleteUser
++                          !ldapSession && (addUserToGroup || deleteUser)
+                             ? selectionChanged
+                             : undefined
+                         }
+diff --git a/web-app/src/screens/Console/Users/UserDetails.tsx b/web-app/src/screens/Console/Users/UserDetails.tsx
+index 0a26d6b..c7cd140 100644
+--- a/web-app/src/screens/Console/Users/UserDetails.tsx
++++ b/web-app/src/screens/Console/Users/UserDetails.tsx
+@@ -16,6 +16,7 @@
+ 
+ import React, { Fragment, useCallback, useEffect, useState } from "react";
+ import { useNavigate, useParams } from "react-router-dom";
++import { useSelector } from "react-redux";
+ import {
+   AddIcon,
+   BackLink,
+@@ -61,6 +62,7 @@ import SetUserPolicies from "./SetUserPolicies";
+ import UserServiceAccountsPanel from "./UserServiceAccountsPanel";
+ import ChangeUserPasswordModal from "../Account/ChangeUserPasswordModal";
+ import DeleteUser from "./DeleteUser";
++import { selFeatures } from "../consoleSlice";
+ 
+ interface IGroupItem {
+   group: string;
+@@ -70,6 +72,7 @@ const UserDetails = () => {
+   const dispatch = useAppDispatch();
+   const params = useParams();
+   const navigate = useNavigate();
++  const features = useSelector(selFeatures);
+ 
+   const [loading, setLoading] = useState<boolean>(false);
+   const [addGroupOpen, setAddGroupOpen] = useState<boolean>(false);
+@@ -84,6 +87,7 @@ const UserDetails = () => {
+   const [deleteOpen, setDeleteOpen] = useState<boolean>(false);
+   const [hasPolicy, setHasPolicy] = useState<boolean>(false);
+   const [selectedTab, setSelectedTab] = useState<string>("groups");
++  const ldapSession = !!features?.includes("ldap-session");
+ 
+   const enableEnabled =
+     hasPermission(CONSOLE_UI_RESOURCE, enableUserPermissions) && !enabled;
+@@ -280,28 +284,30 @@ const UserDetails = () => {
+                   </span>
+                   <TooltipWrapper
+                     tooltip={
+-                      enableEnabled || disableEnabled
+-                        ? ""
+-                        : hasPermission(
+-                              CONSOLE_UI_RESOURCE,
+-                              enableUserPermissions,
+-                            )
+-                          ? permissionTooltipHelper(
+-                              disableUserPermissions,
+-                              "disable users",
+-                            )
++                      ldapSession
++                        ? "LDAP sessions cannot modify local users."
++                        : enableEnabled || disableEnabled
++                          ? ""
+                           : hasPermission(
+                                 CONSOLE_UI_RESOURCE,
+-                                disableUserPermissions,
+-                              )
+-                            ? permissionTooltipHelper(
+                                 enableUserPermissions,
+-                                "enable users",
+                               )
+-                            : permissionTooltipHelper(
+-                                enableDisableUserPermissions,
+-                                "enable or disable users",
++                            ? permissionTooltipHelper(
++                                disableUserPermissions,
++                                "disable users",
+                               )
++                            : hasPermission(
++                                  CONSOLE_UI_RESOURCE,
++                                  disableUserPermissions,
++                                )
++                              ? permissionTooltipHelper(
++                                  enableUserPermissions,
++                                  "enable users",
++                                )
++                              : permissionTooltipHelper(
++                                  enableDisableUserPermissions,
++                                  "enable or disable users",
++                                )
+                     }
+                   >
+                     <Switch
+@@ -315,12 +321,14 @@ const UserDetails = () => {
+                         saveRecord(!enabled);
+                       }}
+                       switchOnly
+-                      disabled={!enableEnabled && !disableEnabled}
++                      disabled={ldapSession || (!enableEnabled && !disableEnabled)}
+                     />
+                   </TooltipWrapper>
+                   <TooltipWrapper
+                     tooltip={
+-                      hasPermission(CONSOLE_UI_RESOURCE, deleteUserPermissions)
++                      ldapSession
++                        ? "LDAP sessions cannot delete local users."
++                        : hasPermission(CONSOLE_UI_RESOURCE, deleteUserPermissions)
+                         ? userLoggedIn === userName
+                           ? "You cannot delete the currently logged in User"
+                           : "Delete User"
+@@ -336,6 +344,7 @@ const UserDetails = () => {
+                       icon={<TrashIcon />}
+                       variant={"secondary"}
+                       disabled={
++                        ldapSession ||
+                         !hasPermission(
+                           CONSOLE_UI_RESOURCE,
+                           deleteUserPermissions,
+@@ -344,13 +353,19 @@ const UserDetails = () => {
+                     />
+                   </TooltipWrapper>
+ 
+-                  <TooltipWrapper tooltip={"Change Password"}>
++                  <TooltipWrapper
++                    tooltip={
++                      ldapSession
++                        ? "LDAP sessions cannot change local user passwords."
++                        : "Change Password"
++                    }
++                  >
+                     <Button
+                       id={"change-user-password"}
+                       onClick={changeUserPassword}
+                       icon={<PasswordKeyIcon />}
+                       variant={"regular"}
+-                      disabled={userLoggedIn === userName}
++                      disabled={ldapSession || userLoggedIn === userName}
+                     />
+                   </TooltipWrapper>
+                 </Fragment>
+@@ -358,6 +373,18 @@ const UserDetails = () => {
+               sx={{ marginBottom: 15 }}
+             />
+           </Grid>
++          {ldapSession && (
++            <Grid item xs={12}>
++              <Box
++                withBorders
++                sx={{ marginBottom: 15, padding: 15, color: "#d1d5db" }}
++              >
++                This LDAP session is read-only for local user administration.
++                Use a local built-in admin account to change groups, policies,
++                password, or status for local users.
++              </Box>
++            </Grid>
++          )}
+ 
+           <Grid item xs={12}>
+             <Tabs
+@@ -368,7 +395,7 @@ const UserDetails = () => {
+                   tabConfig: {
+                     id: "groups",
+                     label: "Groups",
+-                    disabled: !canAssignGroup,
++                    disabled: ldapSession || !canAssignGroup,
+                   },
+                   content: (
+                     <Fragment>
+@@ -383,7 +410,9 @@ const UserDetails = () => {
+                           actions={
+                             <TooltipWrapper
+                               tooltip={
+-                                canAssignGroup
++                                ldapSession
++                                  ? "LDAP sessions cannot change local user groups."
++                                  : canAssignGroup
+                                   ? "Assign groups"
+                                   : permissionTooltipHelper(
+                                       assignGroupPermissions,
+@@ -399,7 +428,7 @@ const UserDetails = () => {
+                                 }}
+                                 icon={<AddIcon />}
+                                 variant={"callAction"}
+-                                disabled={!canAssignGroup}
++                                disabled={ldapSession || !canAssignGroup}
+                               />
+                             </TooltipWrapper>
+                           }
+@@ -446,7 +475,7 @@ const UserDetails = () => {
+                   tabConfig: {
+                     id: "policies",
+                     label: "Policies",
+-                    disabled: !canAssignPolicy,
++                    disabled: ldapSession || !canAssignPolicy,
+                   },
+                   content: (
+                     <Fragment>
+@@ -461,7 +490,9 @@ const UserDetails = () => {
+                           actions={
+                             <TooltipWrapper
+                               tooltip={
+-                                canAssignPolicy
++                                ldapSession
++                                  ? "LDAP sessions cannot change local user policies."
++                                  : canAssignPolicy
+                                   ? "Assign Policies"
+                                   : permissionTooltipHelper(
+                                       assignIAMPolicyPermissions,
+@@ -477,7 +508,7 @@ const UserDetails = () => {
+                                 }}
+                                 icon={<IAMPoliciesIcon />}
+                                 variant={"callAction"}
+-                                disabled={!canAssignPolicy}
++                                disabled={ldapSession || !canAssignPolicy}
+                               />
+                             </TooltipWrapper>
+                           }
 diff --git a/web-app/src/screens/Console/valid-routes.tsx b/web-app/src/screens/Console/valid-routes.tsx
 index bb384e1..350dc26 100644
 --- a/web-app/src/screens/Console/valid-routes.tsx
