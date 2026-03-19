@@ -1,0 +1,89 @@
+diff --git a/api/user_login.go b/api/user_login.go
+index 8ec646d..d2e429c 100644
+--- a/api/user_login.go
++++ b/api/user_login.go
+@@ -37,6 +37,15 @@ import (
+ 	xnet "github.com/minio/pkg/v3/net"
+ )
+ 
++func isLDAPFallbackEnabled() bool {
++	switch strings.ToLower(strings.TrimSpace(env.Get("CONSOLE_LDAP_ENABLED", "on"))) {
++	case "0", "false", "no", "off", "disabled":
++		return false
++	default:
++		return true
++	}
++}
++
+ func registerLoginHandlers(api *operations.ConsoleAPI) {
+ 	// GET login strategy
+ 	api.AuthLoginDetailHandler = authApi.LoginDetailHandlerFunc(func(params authApi.LoginDetailParams) middleware.Responder {
+@@ -124,6 +133,20 @@ func getConsoleCredentials(accessKey, secretKey string, client *http.Client) (*C
+ 	}, nil
+ }
+ 
++func getLDAPConsoleCredentials(accessKey, secretKey string, client *http.Client) (*ConsoleCredentials, error) {
++	creds, err := auth.GetCredentialsFromLDAP(client, getMinIOServer(), accessKey, secretKey)
++	if err != nil {
++		return nil, err
++	}
++	return &ConsoleCredentials{
++		ConsoleCredentials: creds,
++		AccountAccessKey:   accessKey,
++		CredContext: &credentials.CredContext{
++			Client: client,
++		},
++	}, nil
++}
++
+ // getLoginResponse performs login() and serializes it to the handler's output
+ func getLoginResponse(params authApi.LoginParams) (*models.LoginResponse, *CodedAPIError) {
+ 	ctx, cancel := context.WithCancel(params.HTTPRequest.Context())
+@@ -137,30 +160,38 @@ func getLoginResponse(params authApi.LoginParams) (*models.LoginResponse, *Coded
+ 	clientIP := getClientIP(params.HTTPRequest)
+ 	client := GetConsoleHTTPClient(clientIP)
+ 
++	sf := &auth.SessionFeatures{}
++	if lr.Features != nil {
++		sf.HideMenu = lr.Features.HideMenu
++	}
++
+ 	var err error
+-	var consoleCreds *ConsoleCredentials
++	var sessionID *string
+ 	// if we receive an STS we use that instead of the credentials
+ 	if lr.Sts != "" {
+-		consoleCreds = &ConsoleCredentials{
++		consoleCreds := &ConsoleCredentials{
+ 			ConsoleCredentials: credentials.NewStaticV4(lr.AccessKey, lr.SecretKey, lr.Sts),
+ 			AccountAccessKey:   lr.AccessKey,
+ 			CredContext: &credentials.CredContext{
+ 				Client: client,
+ 			},
+ 		}
++		sessionID, err = login(consoleCreds, sf)
+ 	} else {
+ 		// prepare console credentials
+-		consoleCreds, err = getConsoleCredentials(lr.AccessKey, lr.SecretKey, client)
++		consoleCreds, credErr := getConsoleCredentials(lr.AccessKey, lr.SecretKey, client)
++		err = credErr
+ 		if err != nil {
+ 			return nil, ErrorWithContext(ctx, err, ErrInvalidLogin)
+ 		}
++		sessionID, err = login(consoleCreds, sf)
++		if err != nil && !xnet.IsNetworkOrHostDown(err, true) && isLDAPFallbackEnabled() {
++			ldapCreds, ldapErr := getLDAPConsoleCredentials(lr.AccessKey, lr.SecretKey, client)
++			if ldapErr == nil {
++				sessionID, err = login(ldapCreds, sf)
++			}
++		}
+ 	}
+-
+-	sf := &auth.SessionFeatures{}
+-	if lr.Features != nil {
+-		sf.HideMenu = lr.Features.HideMenu
+-	}
+-	sessionID, err := login(consoleCreds, sf)
+ 	if err != nil {
+ 		if xnet.IsNetworkOrHostDown(err, true) {
+ 			return nil, ErrorWithContext(ctx, ErrNetworkError)
