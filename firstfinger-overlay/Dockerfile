@@ -9,7 +9,7 @@ RUN git clone https://github.com/Harsh-2002/MinIO-Object-Browser.git . \
 
 COPY patches/ldap-login.patch /tmp/ldap-login.patch
 RUN git apply /tmp/ldap-login.patch \
-    && python3 -c "import json; from pathlib import Path; p = Path('/src/web-app/package.json'); d = json.loads(p.read_text()); d['dependencies']['mds'] = 'https://codeload.github.com/minio/mds/tar.gz/refs/tags/v1.1.5'; p.write_text(json.dumps(d, indent=2) + '\\n')" \
+    && python3 -c "import json; from pathlib import Path; p = Path('/src/web-app/package.json'); d = json.loads(p.read_text()); d['dependencies']['mds'] = 'https://github.com/OpenMaxIO/mds.git#commit=027fb7f9834e2bd6daba7f62a9d04d9a3606fbe1'; d['packageManager'] = 'yarn@4.9.4'; p.write_text(json.dumps(d, indent=2) + '\\n')" \
     && cd web-app \
     && yarn install \
     && make build-static
