@@ -9,3 +9,18 @@ so UI changes are embedded in the final `console` executable.
 The patch also keeps local `Users` and `Groups` visible when LDAP is enabled,
 adds LDAP identity context to the `Access Keys` page, and redirects the default
 home route to `Monitoring > Metrics`.
+
+Published image:
+
+`ghcr.io/richardbarbosasilva/custom-minio-ui-overlay:latest`
+
+Compose example:
+
+```yaml
+services:
+  minio:
+    image: ghcr.io/richardbarbosasilva/custom-minio-ui-overlay:latest
+```
+
+If GHCR returns `denied`, make the package public once in the repository
+packages settings after the first workflow run.
