@@ -969,7 +969,7 @@ index 40bdfd8..9a0bf88 100644
        </Grid>
      </Fragment>
 diff --git a/web-app/src/screens/Console/Users/ListUsers.tsx b/web-app/src/screens/Console/Users/ListUsers.tsx
-index ad083e5..ed347df 100644
+index ad083e5..be1dabf 100644
 --- a/web-app/src/screens/Console/Users/ListUsers.tsx
 +++ b/web-app/src/screens/Console/Users/ListUsers.tsx
 @@ -18,6 +18,7 @@ import React, { Fragment, useEffect, useState } from "react";
@@ -1004,15 +1004,16 @@ index ad083e5..ed347df 100644
  
    const [records, setRecords] = useState<User[]>([]);
    const [loading, setLoading] = useState<boolean>(true);
-@@ -72,6 +76,7 @@ const ListUsers = () => {
+@@ -72,6 +76,8 @@ const ListUsers = () => {
    const [addGroupOpen, setAddGroupOpen] = useState<boolean>(false);
    const [filter, setFilter] = useState<string>("");
    const [checkedUsers, setCheckedUsers] = useState<string[]>([]);
 +  const ldapSession = !!features?.includes("ldap-session");
++  const ldapConfigured = !!features?.includes("ldap-idp");
  
    const displayListUsers = hasPermission(
      CONSOLE_UI_RESOURCE,
-@@ -203,130 +208,148 @@ const ListUsers = () => {
+@@ -203,130 +209,162 @@ const ListUsers = () => {
                  maxWidth: 380,
                }}
              />
@@ -1257,6 +1258,20 @@ index ad083e5..ed347df 100644
            {loading && <ProgressBar />}
            {!loading && (
              <Fragment>
++              {ldapConfigured && (
++                <Grid item xs={12}>
++                  <Box
++                    withBorders
++                    sx={{ marginBottom: 15, padding: 15, color: "#d1d5db" }}
++                  >
++                    LDAP identities stay managed as external users. They only
++                    appear in this list after an explicit MinIO user mapping is
++                    created for that DN. Users inheriting access only from an
++                    LDAP group remain managed under LDAP entities and are not
++                    converted into local MinIO users automatically.
++                  </Box>
++                </Grid>
++              )}
 +              {ldapSession && (
 +                <Grid item xs={12}>
 +                  <Box
@@ -1272,7 +1287,7 @@ index ad083e5..ed347df 100644
                {records.length > 0 && (
                  <Fragment>
                    <Grid item xs={12} sx={{ marginBottom: 15 }}>
-@@ -341,7 +364,7 @@ const ListUsers = () => {
+@@ -341,7 +379,7 @@ const ListUsers = () => {
                            { label: "Access Key", elementKey: "accessKey" },
                          ]}
                          onSelect={
