@@ -1,5 +1,330 @@
+diff --git a/api/admin_groups.go b/api/admin_groups.go
+index 94c1f37..6555874 100644
+--- a/api/admin_groups.go
++++ b/api/admin_groups.go
+@@ -86,6 +86,7 @@ func getListGroupsResponse(session *models.Principal, params groupApi.ListGroups
+ 	if err != nil {
+ 		return nil, ErrorWithContext(ctx, err)
+ 	}
++	groups = filterLDAPLocalIAMInternalGroups(groups)
+ 
+ 	// serialize output
+ 	listGroupsResponse := &models.ListGroupsResponse{
+@@ -121,6 +122,9 @@ func getGroupInfoResponse(session *models.Principal, params groupApi.GroupInfoPa
+ 	if err != nil {
+ 		return nil, ErrorWithContext(ctx, err)
+ 	}
++	if isLDAPLocalIAMInternalGroup(groupDesc.Name) {
++		return nil, ErrorWithContext(ctx, errors.New(404, "Group doesn't exist"))
++	}
+ 
+ 	groupResponse := &models.Group{
+ 		Members: groupDesc.Members,
+diff --git a/api/admin_users.go b/api/admin_users.go
+index b37296a..503e78c 100644
+--- a/api/admin_users.go
++++ b/api/admin_users.go
+@@ -141,7 +141,7 @@ func listUsers(ctx context.Context, client MinioAdmin) ([]*models.User, error) {
+ 			AccessKey: accessKey,
+ 			Status:    string(user.Status),
+ 			Policy:    strings.Split(user.PolicyName, ","),
+-			MemberOf:  user.MemberOf,
++			MemberOf:  filterLDAPLocalIAMInternalGroups(user.MemberOf),
+ 		}
+ 		users = append(users, userElem)
+ 	}
+@@ -300,6 +300,8 @@ func getUserInfoResponse(session *models.Principal, params userApi.GetUserInfoPa
+ 		return nil, ErrorWithContext(ctx, err)
+ 	}
+ 
++	filteredMemberOf := filterLDAPLocalIAMInternalGroups(user.MemberOf)
++
+ 	var policies []string
+ 	if user.PolicyName == "" {
+ 		policies = []string{}
+@@ -311,8 +313,8 @@ func getUserInfoResponse(session *models.Principal, params userApi.GetUserInfoPa
+ 
+ 	if len(policies) == 0 {
+ 		hasPolicy = false
+-		for i := 0; i < len(user.MemberOf); i++ {
+-			group, err := adminClient.getGroupDescription(ctx, user.MemberOf[i])
++		for i := 0; i < len(filteredMemberOf); i++ {
++			group, err := adminClient.getGroupDescription(ctx, filteredMemberOf[i])
+ 			if err != nil {
+ 				continue
+ 			}
+@@ -325,7 +327,7 @@ func getUserInfoResponse(session *models.Principal, params userApi.GetUserInfoPa
+ 
+ 	userInformation := &models.User{
+ 		AccessKey: params.Name,
+-		MemberOf:  user.MemberOf,
++		MemberOf:  filteredMemberOf,
+ 		Policy:    policies,
+ 		Status:    string(user.Status),
+ 		HasPolicy: hasPolicy,
+@@ -338,6 +340,8 @@ func getUserInfoResponse(session *models.Principal, params userApi.GetUserInfoPa
+ // then we merge the list with the new groups list to have a shorter iteration between groups and we do a comparison between the current and old groups.
+ // We delete or update the groups according the location in each list and send the user with the new groups from `MinioAdmin` to the client
+ func updateUserGroups(ctx context.Context, client MinioAdmin, user string, groupsToAssign []string) (*models.User, error) {
++	preservedGroups := []string{}
++
+ 	parallelUserUpdate := func(groupName string, originGroups []string) chan error {
+ 		chProcess := make(chan error)
+ 
+@@ -345,7 +349,7 @@ func updateUserGroups(ctx context.Context, client MinioAdmin, user string, group
+ 			defer close(chProcess)
+ 
+ 			// Compare if groupName is in the arrays
+-			isGroupPersistent := IsElementInArray(groupsToAssign, groupName)
++			isGroupPersistent := IsElementInArray(preservedGroups, groupName)
+ 			isInOriginGroups := IsElementInArray(originGroups, groupName)
+ 
+ 			if isGroupPersistent && isInOriginGroups { // Group is already assigned and doesn't need to be updated
+@@ -379,7 +383,18 @@ func updateUserGroups(ctx context.Context, client MinioAdmin, user string, group
+ 	}
+ 
+ 	memberOf := userInfoOr.MemberOf
+-	mergedGroupArray := UniqueKeys(append(memberOf, groupsToAssign...))
++	internalGroups := make([]string, 0)
++	visibleGroups := make([]string, 0, len(memberOf))
++	for _, groupName := range memberOf {
++		if isLDAPLocalIAMInternalGroup(groupName) {
++			internalGroups = append(internalGroups, groupName)
++			continue
++		}
++		visibleGroups = append(visibleGroups, groupName)
++	}
++
++	preservedGroups = UniqueKeys(append(append([]string{}, groupsToAssign...), internalGroups...))
++	mergedGroupArray := UniqueKeys(append(visibleGroups, preservedGroups...))
+ 
+ 	var listOfUpdates []chan error
+ 
+@@ -414,7 +429,7 @@ func updateUserGroups(ctx context.Context, client MinioAdmin, user string, group
+ 
+ 	userReturn := &models.User{
+ 		AccessKey: user,
+-		MemberOf:  userInfo.MemberOf,
++		MemberOf:  filterLDAPLocalIAMInternalGroups(userInfo.MemberOf),
+ 		Policy:    policies,
+ 		Status:    string(userInfo.Status),
+ 	}
+diff --git a/api/ldap_local_iam.go b/api/ldap_local_iam.go
+new file mode 100644
+index 0000000..9f657f2
+--- /dev/null
++++ b/api/ldap_local_iam.go
+@@ -0,0 +1,208 @@
++package api
++
++import (
++	"context"
++	"net/http"
++	"strings"
++
++	"github.com/minio/console/pkg/auth"
++	"github.com/minio/madmin-go/v3"
++	"github.com/minio/minio-go/v7/pkg/credentials"
++	"github.com/minio/pkg/v3/env"
++)
++
++const (
++	ldapLocalIAMSyncEnabledEnv   = "CONSOLE_LDAP_SYNC_LOCAL_IAM"
++	ldapLocalIAMMarkerGroupEnv   = "CONSOLE_LDAP_SYNC_LOCAL_IAM_MARKER_GROUP"
++	ldapLocalIAMDefaultPolicyEnv = "CONSOLE_LDAP_SYNC_LOCAL_IAM_DEFAULT_POLICIES"
++
++	defaultLDAPLocalIAMMarkerGroup   = "__console_ldap_managed"
++	defaultLDAPLocalIAMDefaultPolicy = "diagnostics"
++)
++
++func isLDAPLocalIAMSyncEnabled() bool {
++	switch strings.ToLower(strings.TrimSpace(env.Get(ldapLocalIAMSyncEnabledEnv, "off"))) {
++	case "1", "true", "yes", "on", "enabled":
++		return true
++	default:
++		return false
++	}
++}
++
++func getLDAPLocalIAMMarkerGroup() string {
++	return strings.TrimSpace(env.Get(ldapLocalIAMMarkerGroupEnv, defaultLDAPLocalIAMMarkerGroup))
++}
++
++func getLDAPLocalIAMDefaultPolicies() []string {
++	raw := strings.TrimSpace(env.Get(ldapLocalIAMDefaultPolicyEnv, defaultLDAPLocalIAMDefaultPolicy))
++	if raw == "" {
++		return nil
++	}
++
++	seen := map[string]struct{}{}
++	policies := make([]string, 0)
++	for _, part := range strings.Split(raw, ",") {
++		policyName := strings.TrimSpace(part)
++		if policyName == "" {
++			continue
++		}
++		if _, ok := seen[policyName]; ok {
++			continue
++		}
++		seen[policyName] = struct{}{}
++		policies = append(policies, policyName)
++	}
++
++	return policies
++}
++
++func isLDAPLocalIAMInternalGroup(groupName string) bool {
++	return strings.TrimSpace(groupName) == getLDAPLocalIAMMarkerGroup()
++}
++
++func filterLDAPLocalIAMInternalGroups(groups []string) []string {
++	filtered := make([]string, 0, len(groups))
++	for _, groupName := range groups {
++		if isLDAPLocalIAMInternalGroup(groupName) {
++			continue
++		}
++		filtered = append(filtered, groupName)
++	}
++	return filtered
++}
++
++func getLocalIAMConsoleCredentials(accessKey, secretKey string, client *http.Client) (*ConsoleCredentials, error) {
++	creds, err := stsCredentials(getMinIOServer(), accessKey, secretKey, GetMinIORegion(), client)
++	if err != nil {
++		return nil, err
++	}
++
++	return &ConsoleCredentials{
++		ConsoleCredentials: creds,
++		AccountAccessKey:   accessKey,
++		CredContext: &credentials.CredContext{
++			Client: client,
++		},
++	}, nil
++}
++
++func getProvisioningAdminClient(clientIP string) (*madmin.AdminClient, error) {
++	rootUser := strings.TrimSpace(env.Get("MINIO_ROOT_USER", ""))
++	rootPassword := strings.TrimSpace(env.Get("MINIO_ROOT_PASSWORD", ""))
++	if rootUser == "" || rootPassword == "" {
++		return nil, ErrInvalidLogin
++	}
++
++	adminClient, err := newAdminFromCreds(rootUser, rootPassword, getMinIOEndpoint(), getMinIOEndpointIsSecure())
++	if err != nil {
++		return nil, err
++	}
++	adminClient.SetCustomTransport(PrepareSTSClientTransport(clientIP))
++	return adminClient, nil
++}
++
++func lookupLocalIAMUser(ctx context.Context, client MinioAdmin, accessKey string) (*madmin.UserInfo, bool, error) {
++	userInfo, err := client.getUserInfo(ctx, accessKey)
++	if err != nil {
++		if madmin.ToErrorResponse(err).Code == "XMinioAdminNoSuchUser" {
++			return nil, false, nil
++		}
++		return nil, false, err
++	}
++
++	return &userInfo, true, nil
++}
++
++func isLDAPManagedLocalUser(ctx context.Context, client MinioAdmin, accessKey string) (bool, error) {
++	userInfo, exists, err := lookupLocalIAMUser(ctx, client, accessKey)
++	if err != nil || !exists {
++		return false, err
++	}
++
++	for _, groupName := range userInfo.MemberOf {
++		if isLDAPLocalIAMInternalGroup(groupName) {
++			return true, nil
++		}
++	}
++
++	return false, nil
++}
++
++func ensureLDAPManagedLocalUser(ctx context.Context, client MinioAdmin, accessKey, secretKey string) error {
++	_, exists, err := lookupLocalIAMUser(ctx, client, accessKey)
++	if err != nil {
++		return err
++	}
++
++	if !exists {
++		if err = client.addUser(ctx, accessKey, secretKey); err != nil {
++			return err
++		}
++		defaultPolicies := getLDAPLocalIAMDefaultPolicies()
++		if len(defaultPolicies) > 0 {
++			if err = SetPolicy(ctx, client, strings.Join(defaultPolicies, ","), accessKey, "user"); err != nil {
++				return err
++			}
++		}
++	} else {
++		if err = client.changePassword(ctx, accessKey, secretKey); err != nil {
++			return err
++		}
++	}
++
++	markerGroup := getLDAPLocalIAMMarkerGroup()
++	if markerGroup == "" {
++		return nil
++	}
++
++	return updateGroupMembers(ctx, client, markerGroup, []string{accessKey}, false)
++}
++
++func loginWithLDAPLocalIAMSync(
++	ctx context.Context,
++	accessKey string,
++	secretKey string,
++	clientIP string,
++	client *http.Client,
++	sessionFeatures *auth.SessionFeatures,
++) (*string, error) {
++	ldapCreds, ldapErr := getLDAPConsoleCredentials(accessKey, secretKey, client)
++	if ldapErr != nil {
++		return nil, ldapErr
++	}
++
++	ldapSessionID, err := login(ldapCreds, sessionFeatures)
++	if err != nil {
++		return nil, err
++	}
++
++	if !isLDAPLocalIAMSyncEnabled() {
++		return ldapSessionID, nil
++	}
++
++	provisioningAdmin, err := getProvisioningAdminClient(clientIP)
++	if err != nil {
++		LogError("unable to initialize provisioning admin client for LDAP-local IAM sync: %v", err)
++		return ldapSessionID, nil
++	}
++
++	adminClient := AdminClient{Client: provisioningAdmin}
++	if err = ensureLDAPManagedLocalUser(ctx, adminClient, accessKey, secretKey); err != nil {
++		LogError("unable to synchronize LDAP user %s into local IAM: %v", accessKey, err)
++		return ldapSessionID, nil
++	}
++
++	localCreds, err := getLocalIAMConsoleCredentials(accessKey, secretKey, client)
++	if err != nil {
++		LogError("unable to build local IAM credentials for synced LDAP user %s: %v", accessKey, err)
++		return ldapSessionID, nil
++	}
++
++	localSessionID, err := login(localCreds, sessionFeatures)
++	if err != nil {
++		LogError("unable to create local IAM session for synced LDAP user %s: %v", accessKey, err)
++		return ldapSessionID, nil
++	}
++
++	return localSessionID, nil
++}
 diff --git a/api/user_login.go b/api/user_login.go
-index 8ec646d..d2e429c 100644
+index 8ec646d..fe3ae76 100644
 --- a/api/user_login.go
 +++ b/api/user_login.go
 @@ -37,6 +37,15 @@ import (
@@ -18,28 +343,24 @@ index 8ec646d..d2e429c 100644
  func registerLoginHandlers(api *operations.ConsoleAPI) {
  	// GET login strategy
  	api.AuthLoginDetailHandler = authApi.LoginDetailHandlerFunc(func(params authApi.LoginDetailParams) middleware.Responder {
-@@ -124,6 +133,20 @@ func getConsoleCredentials(accessKey, secretKey string, client *http.Client) (*C
- 	}, nil
- }
+@@ -111,7 +120,15 @@ func getAccountInfo(ctx context.Context, client MinioAdmin) (*madmin.AccountInfo
  
-+func getLDAPConsoleCredentials(accessKey, secretKey string, client *http.Client) (*ConsoleCredentials, error) {
-+	creds, err := auth.GetCredentialsFromLDAP(client, getMinIOServer(), accessKey, secretKey)
+ // getConsoleCredentials will return ConsoleCredentials interface
+ func getConsoleCredentials(accessKey, secretKey string, client *http.Client) (*ConsoleCredentials, error) {
+-	creds, err := NewConsoleCredentials(accessKey, secretKey, GetMinIORegion(), client)
++	creds, err := getLocalIAMConsoleCredentials(accessKey, secretKey, client)
 +	if err != nil {
 +		return nil, err
 +	}
-+	return &ConsoleCredentials{
-+		ConsoleCredentials: creds,
-+		AccountAccessKey:   accessKey,
-+		CredContext: &credentials.CredContext{
-+			Client: client,
-+		},
-+	}, nil
++	return creds, nil
 +}
 +
- // getLoginResponse performs login() and serializes it to the handler's output
- func getLoginResponse(params authApi.LoginParams) (*models.LoginResponse, *CodedAPIError) {
- 	ctx, cancel := context.WithCancel(params.HTTPRequest.Context())
-@@ -137,30 +160,38 @@ func getLoginResponse(params authApi.LoginParams) (*models.LoginResponse, *Coded
++func getLDAPConsoleCredentials(accessKey, secretKey string, client *http.Client) (*ConsoleCredentials, error) {
++	creds, err := auth.GetCredentialsFromLDAP(client, getMinIOServer(), accessKey, secretKey)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -137,30 +154,43 @@ func getLoginResponse(params authApi.LoginParams) (*models.LoginResponse, *Coded
  	clientIP := getClientIP(params.HTTPRequest)
  	client := GetConsoleHTTPClient(clientIP)
  
@@ -51,6 +372,12 @@ index 8ec646d..d2e429c 100644
  	var err error
 -	var consoleCreds *ConsoleCredentials
 +	var sessionID *string
++	ldapManagedLocalUser := false
++	if isLDAPFallbackEnabled() && isLDAPLocalIAMSyncEnabled() && lr.Sts == "" {
++		if provisioningAdmin, provErr := getProvisioningAdminClient(clientIP); provErr == nil {
++			ldapManagedLocalUser, _ = isLDAPManagedLocalUser(ctx, AdminClient{Client: provisioningAdmin}, lr.AccessKey)
++		}
++	}
  	// if we receive an STS we use that instead of the credentials
  	if lr.Sts != "" {
 -		consoleCreds = &ConsoleCredentials{
@@ -62,6 +389,8 @@ index 8ec646d..d2e429c 100644
  			},
  		}
 +		sessionID, err = login(consoleCreds, sf)
++	} else if ldapManagedLocalUser {
++		sessionID, err = loginWithLDAPLocalIAMSync(ctx, lr.AccessKey, lr.SecretKey, clientIP, client, sf)
  	} else {
  		// prepare console credentials
 -		consoleCreds, err = getConsoleCredentials(lr.AccessKey, lr.SecretKey, client)
@@ -72,10 +401,7 @@ index 8ec646d..d2e429c 100644
  		}
 +		sessionID, err = login(consoleCreds, sf)
 +		if err != nil && !xnet.IsNetworkOrHostDown(err, true) && isLDAPFallbackEnabled() {
-+			ldapCreds, ldapErr := getLDAPConsoleCredentials(lr.AccessKey, lr.SecretKey, client)
-+			if ldapErr == nil {
-+				sessionID, err = login(ldapCreds, sf)
-+			}
++			sessionID, err = loginWithLDAPLocalIAMSync(ctx, lr.AccessKey, lr.SecretKey, clientIP, client, sf)
 +		}
  	}
 -
@@ -969,7 +1295,7 @@ index 40bdfd8..9a0bf88 100644
        </Grid>
      </Fragment>
 diff --git a/web-app/src/screens/Console/Users/ListUsers.tsx b/web-app/src/screens/Console/Users/ListUsers.tsx
-index ad083e5..be1dabf 100644
+index ad083e5..7c53f4e 100644
 --- a/web-app/src/screens/Console/Users/ListUsers.tsx
 +++ b/web-app/src/screens/Console/Users/ListUsers.tsx
 @@ -18,6 +18,7 @@ import React, { Fragment, useEffect, useState } from "react";
@@ -1013,7 +1339,7 @@ index ad083e5..be1dabf 100644
  
    const displayListUsers = hasPermission(
      CONSOLE_UI_RESOURCE,
-@@ -203,130 +209,162 @@ const ListUsers = () => {
+@@ -203,130 +209,163 @@ const ListUsers = () => {
                  maxWidth: 380,
                }}
              />
@@ -1264,11 +1590,12 @@ index ad083e5..be1dabf 100644
 +                    withBorders
 +                    sx={{ marginBottom: 15, padding: 15, color: "#d1d5db" }}
 +                  >
-+                    LDAP identities stay managed as external users. They only
-+                    appear in this list after an explicit MinIO user mapping is
-+                    created for that DN. Users inheriting access only from an
-+                    LDAP group remain managed under LDAP entities and are not
-+                    converted into local MinIO users automatically.
++                    LDAP identities remain authenticated by the directory. They
++                    only appear in this list after Console creates or syncs a
++                    local IAM user for them. If automatic local IAM sync is
++                    disabled, users inheriting access only from an LDAP group
++                    stay managed under LDAP entities and are not converted into
++                    local MinIO users automatically.
 +                  </Box>
 +                </Grid>
 +              )}
@@ -1287,7 +1614,7 @@ index ad083e5..be1dabf 100644
                {records.length > 0 && (
                  <Fragment>
                    <Grid item xs={12} sx={{ marginBottom: 15 }}>
-@@ -341,7 +379,7 @@ const ListUsers = () => {
+@@ -341,7 +380,7 @@ const ListUsers = () => {
                            { label: "Access Key", elementKey: "accessKey" },
                          ]}
                          onSelect={
