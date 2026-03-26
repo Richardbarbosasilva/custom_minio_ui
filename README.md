@@ -27,7 +27,7 @@ This project remains based on MinIO Console and keeps the original AGPLv3 licens
 | Object Browser                       | Creating a bucket                     | Object Details                  |
 |--------------------------------------|-------------------------------|---------------------------------|
 | ![Object Browser](images/chrome_FdkWfMrw6E.png) | ![Dashboard](images/pic2-a.png) | ![Dashboard](images/pic3-a.png) |
-| ![Object Browser](images/pic1-b.png) | ![Dashboard](images/pic2-b.png) | ![Dashboard](images/pic3-b.png) |
+| ![Object Browser](images/chrome_p8vI9wHkRu.png) | ![Dashboard](images/pic2-b.png) | ![Dashboard](images/pic3-b.png) |
 
 <!-- markdown-toc start - Don't edit this section. Run M-x markdown-toc-refresh-toc -->
 **Table of Contents**
