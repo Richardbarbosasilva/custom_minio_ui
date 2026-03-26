@@ -1,4 +1,4 @@
-<p align="center" font-size="22px"># MinIO Custom Interface</p>
+<p align="center" font-size="28px"> MinIO Custom Interface</p>
 
 <p align="center">
   <img src="images/minio.png" alt="MinIO" width="220">
