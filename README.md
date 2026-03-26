@@ -1,6 +1,6 @@
 # MinIO Console
 
-<p align="left">
+<p align="center">
   <img src="images/minio.png" alt="MinIO" width="220">
 </p> ![license](https://img.shields.io/badge/license-AGPL%20V3-blue)
 
