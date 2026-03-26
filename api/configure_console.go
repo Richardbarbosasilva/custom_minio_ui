@@ -95,6 +95,9 @@ func configureAPI(api *operations.ConsoleAPI) http.Handler {
 			api.Logger("Unable to validate the session token %s: %v", token, err)
 			return nil, errors.New(401, "incorrect api key auth")
 		}
+		if claims.TOTPPending {
+			return nil, errors.New(401, "two-step verification pending")
+		}
 		return &models.Principal{
 			STSAccessKeyID:     claims.STSAccessKeyID,
 			STSSecretAccessKey: claims.STSSecretAccessKey,

@@ -46,6 +46,12 @@ type LoginRequest struct {
 
 	// sts
 	Sts string `json:"sts,omitempty"`
+
+	// totp challenge
+	TotpChallenge string `json:"totpChallenge,omitempty"`
+
+	// totp passcode
+	TotpPasscode string `json:"totpPasscode,omitempty"`
 }
 
 // Validate validates this login request

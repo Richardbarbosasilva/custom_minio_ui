@@ -4,6 +4,26 @@
 
 A graphical user interface for [MinIO](https://github.com/minio/minio)
 
+## Custom Fork Notes
+
+This repository contains a custom MinIO Console fork prepared for production use in homelab and enterprise-style environments.
+
+Current customizations on top of the upstream console:
+
+- TOTP-based two-factor authentication integrated into the login flow.
+- QR code onboarding and manual secret enrollment for authenticator apps.
+- Portuguese text in the custom TOTP login experience.
+- Default post-login redirect changed from `/browser` to `/tools/metrics`.
+- Compatibility fixes for the current MinIO login form rendering.
+
+Production container tag:
+
+```text
+ghcr.io/richardbarbosasilva/custom-minio-ui-overlay:totp-prod-default
+```
+
+This project remains based on MinIO Console and keeps the original AGPLv3 licensing terms.
+
 | Object Browser                       | Creating a bucket                     | Object Details                  |
 |--------------------------------------|-------------------------------|---------------------------------|
 | ![Object Browser](images/pic1-a.png) | ![Dashboard](images/pic2-a.png) | ![Dashboard](images/pic3-a.png) |

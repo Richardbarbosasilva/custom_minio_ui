@@ -68,6 +68,8 @@ type TokenClaims struct {
 	HideMenu           bool   `json:"hm,omitempty"`
 	ObjectBrowser      bool   `json:"ob,omitempty"`
 	CustomStyleOB      string `json:"customStyleOb,omitempty"`
+	TOTPPending        bool   `json:"tp,omitempty"`
+	TOTPExpiresAt      int64  `json:"te,omitempty"`
 }
 
 // STSClaims claims struct for STS Token
@@ -114,17 +116,29 @@ func SessionTokenAuthenticate(token string) (*TokenClaims, error) {
 // NewEncryptedTokenForClient generates a new session token with claims based on the provided STS credentials, first
 // encrypts the claims and the sign them
 func NewEncryptedTokenForClient(credentials *credentials.Value, accountAccessKey string, features *SessionFeatures) (string, error) {
+	return newEncryptedTokenForClient(credentials, accountAccessKey, features, false, 0)
+}
+
+func NewPendingTotpTokenForClient(credentials *credentials.Value, accountAccessKey string, features *SessionFeatures, validFor time.Duration) (string, error) {
+	return newEncryptedTokenForClient(credentials, accountAccessKey, features, true, validFor)
+}
+
+func newEncryptedTokenForClient(credentials *credentials.Value, accountAccessKey string, features *SessionFeatures, totpPending bool, validFor time.Duration) (string, error) {
 	if credentials != nil {
 		tokenClaims := &TokenClaims{
 			STSAccessKeyID:     credentials.AccessKeyID,
 			STSSecretAccessKey: credentials.SecretAccessKey,
 			STSSessionToken:    credentials.SessionToken,
 			AccountAccessKey:   accountAccessKey,
+			TOTPPending:        totpPending,
 		}
 		if features != nil {
 			tokenClaims.HideMenu = features.HideMenu
 			tokenClaims.ObjectBrowser = features.ObjectBrowser
 			tokenClaims.CustomStyleOB = features.CustomStyleOB
+		}
+		if totpPending && validFor > 0 {
+			tokenClaims.TOTPExpiresAt = time.Now().Add(validFor).Unix()
 		}
 
 		encryptedClaims, err := encryptClaims(tokenClaims)

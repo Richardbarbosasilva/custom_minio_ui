@@ -17,9 +17,15 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"image/png"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-openapi/runtime"
 	"github.com/go-openapi/runtime/middleware"
@@ -27,10 +33,14 @@ import (
 	authApi "github.com/minio/console/api/operations/auth"
 	"github.com/minio/console/models"
 	"github.com/minio/console/pkg/auth"
+	"github.com/minio/console/pkg/auth/idp/oauth2"
+	totpStore "github.com/minio/console/pkg/auth/totp"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/pkg/v3/env"
 	xnet "github.com/minio/pkg/v3/net"
+	"github.com/pquerna/otp"
+	"github.com/pquerna/otp/totp"
 )
 
 var (
@@ -39,10 +49,23 @@ var (
 	loginForSession                   = login
 )
 
+type totpSetupResponse struct {
+	Secret      string `json:"secret"`
+	Issuer      string `json:"issuer"`
+	AccountName string `json:"accountName"`
+	QRCode      string `json:"qrCode,omitempty"`
+}
+
+type loginTotpResponse struct {
+	RequiresTotp  bool               `json:"requiresTotp"`
+	TotpChallenge string             `json:"totpChallenge,omitempty"`
+	TotpSetup     *totpSetupResponse `json:"totpSetup,omitempty"`
+}
+
 func registerLoginHandlers(api *operations.ConsoleAPI) {
 	// GET login strategy
-	api.AuthLoginDetailHandler = authApi.LoginDetailHandlerFunc(func(_ authApi.LoginDetailParams) middleware.Responder {
-		loginDetails, err := getLoginDetailsResponse()
+	api.AuthLoginDetailHandler = authApi.LoginDetailHandlerFunc(func(params authApi.LoginDetailParams) middleware.Responder {
+		loginDetails, err := getLoginDetailsResponse(params, GlobalMinIOConfig.OpenIDProviders)
 		if err != nil {
 			return authApi.NewLoginDetailDefault(err.Code).WithPayload(err.APIError)
 		}
@@ -50,15 +73,40 @@ func registerLoginHandlers(api *operations.ConsoleAPI) {
 	})
 	// POST login using user credentials
 	api.AuthLoginHandler = authApi.LoginHandlerFunc(func(params authApi.LoginParams) middleware.Responder {
-		loginResponse, err := getLoginResponse(params)
+		loginResponse, totpResponse, err := getLoginResponse(params)
 		if err != nil {
 			return authApi.NewLoginDefault(err.Code).WithPayload(err.APIError)
+		}
+		return middleware.ResponderFunc(func(w http.ResponseWriter, p runtime.Producer) {
+			if totpResponse != nil {
+				writeJSONResponse(w, http.StatusAccepted, totpResponse)
+				return
+			}
+
+			cookie := NewSessionCookieForConsole(loginResponse.SessionID)
+			http.SetCookie(w, &cookie)
+			authApi.NewLoginNoContent().WriteResponse(w, p)
+		})
+	})
+	// POST login using external IDP
+	api.AuthLoginOauth2AuthHandler = authApi.LoginOauth2AuthHandlerFunc(func(params authApi.LoginOauth2AuthParams) middleware.Responder {
+		loginResponse, err := getLoginOauth2AuthResponse(params, GlobalMinIOConfig.OpenIDProviders)
+		if err != nil {
+			return authApi.NewLoginOauth2AuthDefault(err.Code).WithPayload(err.APIError)
 		}
 		// Custom response writer to set the session cookies
 		return middleware.ResponderFunc(func(w http.ResponseWriter, p runtime.Producer) {
 			cookie := NewSessionCookieForConsole(loginResponse.SessionID)
 			http.SetCookie(w, &cookie)
-			authApi.NewLoginNoContent().WriteResponse(w, p)
+			http.SetCookie(w, &http.Cookie{
+				Path:     "/",
+				Name:     "idp-refresh-token",
+				Value:    loginResponse.IDPRefreshToken,
+				HttpOnly: true,
+				Secure:   len(GlobalPublicCerts) > 0,
+				SameSite: http.SameSiteLaxMode,
+			})
+			authApi.NewLoginOauth2AuthNoContent().WriteResponse(w, p)
 		})
 	})
 }
@@ -121,14 +169,19 @@ func getLDAPConsoleCredentials(accessKey, secretKey string, client *http.Client)
 }
 
 // getLoginResponse performs login() and serializes it to the handler's output
-func getLoginResponse(params authApi.LoginParams) (*models.LoginResponse, *CodedAPIError) {
+func getLoginResponse(params authApi.LoginParams) (*models.LoginResponse, *loginTotpResponse, *CodedAPIError) {
 	ctx, cancel := context.WithCancel(params.HTTPRequest.Context())
 	defer cancel()
 	lr := params.Body
+	if lr == nil {
+		return nil, nil, ErrorWithContext(ctx, ErrBadRequest)
+	}
 	// trim any leading and trailing whitespace from the login request
 	lr.AccessKey = strings.TrimSpace(lr.AccessKey)
 	lr.SecretKey = strings.TrimSpace(lr.SecretKey)
 	lr.Sts = strings.TrimSpace(lr.Sts)
+	lr.TotpChallenge = strings.TrimSpace(lr.TotpChallenge)
+	lr.TotpPasscode = strings.TrimSpace(lr.TotpPasscode)
 
 	clientIP := getClientIP(params.HTTPRequest)
 	client := GetConsoleHTTPClient(clientIP)
@@ -138,44 +191,85 @@ func getLoginResponse(params authApi.LoginParams) (*models.LoginResponse, *Coded
 		sf.HideMenu = lr.Features.HideMenu
 	}
 
+	if lr.TotpChallenge != "" {
+		loginResponse, apiErr := verifyTotpChallengeResponse(ctx, lr, sf)
+		return loginResponse, nil, apiErr
+	}
+
 	var err error
-	var sessionID *string
+	var consoleCreds *ConsoleCredentials
+	var tokens credentials.Value
 	// if we receive an STS we use that instead of the credentials
 	if lr.Sts != "" {
-		consoleCreds := &ConsoleCredentials{
+		consoleCreds = &ConsoleCredentials{
 			ConsoleCredentials: credentials.NewStaticV4(lr.AccessKey, lr.SecretKey, lr.Sts),
 			AccountAccessKey:   lr.AccessKey,
 			CredContext: &credentials.CredContext{
 				Client: client,
 			},
 		}
-		sessionID, err = loginForSession(consoleCreds, sf)
+		tokens, err = consoleCreds.Get()
 	} else {
-		var consoleCreds *ConsoleCredentials
 		consoleCreds, err = getConsoleCredentialsForLogin(lr.AccessKey, lr.SecretKey, client)
 		if err != nil {
-			return nil, ErrorWithContext(ctx, err, ErrInvalidLogin)
+			return nil, nil, ErrorWithContext(ctx, err, ErrInvalidLogin)
 		}
-		sessionID, err = loginForSession(consoleCreds, sf)
+		tokens, err = consoleCreds.Get()
 		if err != nil && !xnet.IsNetworkOrHostDown(err, true) && auth.IsLDAPEnabled() {
-			var ldapCreds *ConsoleCredentials
 			ldapCreds, ldapErr := getLDAPConsoleCredentialsForLogin(lr.AccessKey, lr.SecretKey, client)
 			if ldapErr == nil {
-				sessionID, err = loginForSession(ldapCreds, sf)
+				ldapTokens, tokenErr := ldapCreds.Get()
+				if tokenErr == nil {
+					consoleCreds = ldapCreds
+					tokens = ldapTokens
+					err = nil
+				} else {
+					err = tokenErr
+				}
 			}
 		}
 	}
 	if err != nil {
 		if xnet.IsNetworkOrHostDown(err, true) {
-			return nil, ErrorWithContext(ctx, ErrNetworkError)
+			return nil, nil, ErrorWithContext(ctx, ErrNetworkError)
 		}
-		return nil, ErrorWithContext(ctx, err, ErrInvalidLogin)
+		return nil, nil, ErrorWithContext(ctx, err, ErrInvalidLogin)
 	}
-	// serialize output
-	loginResponse := &models.LoginResponse{
-		SessionID: *sessionID,
+
+	accountAccessKey := consoleCreds.GetAccountAccessKey()
+	if !totpStore.Enabled() || accountAccessKey == "" {
+		sessionID, err := auth.NewEncryptedTokenForClient(&tokens, accountAccessKey, sf)
+		if err != nil {
+			return nil, nil, ErrorWithContext(ctx, err, ErrInvalidLogin)
+		}
+
+		return &models.LoginResponse{SessionID: sessionID}, nil, nil
 	}
-	return loginResponse, nil
+
+	record, _, err := totpStore.DefaultStore().GetOrCreate(accountAccessKey)
+	if err != nil {
+		return nil, nil, ErrorWithContext(ctx, err)
+	}
+
+	challengeToken, err := auth.NewPendingTotpTokenForClient(&tokens, accountAccessKey, sf, totpStore.ChallengeExpiry())
+	if err != nil {
+		return nil, nil, ErrorWithContext(ctx, err)
+	}
+
+	totpResponse := &loginTotpResponse{
+		RequiresTotp:  true,
+		TotpChallenge: challengeToken,
+	}
+
+	if !record.Verified {
+		setup, buildErr := buildTotpSetupResponse(record)
+		if buildErr != nil {
+			return nil, nil, ErrorWithContext(ctx, buildErr)
+		}
+		totpResponse.TotpSetup = &setup
+	}
+
+	return nil, totpResponse, nil
 }
 
 // isKubernetes returns true if minio is running in kubernetes.
@@ -188,11 +282,61 @@ func isKubernetes() bool {
 }
 
 // getLoginDetailsResponse returns information regarding the Console authentication mechanism.
-func getLoginDetailsResponse() (ld *models.LoginDetails, apiErr *CodedAPIError) {
+func getLoginDetailsResponse(params authApi.LoginDetailParams, openIDProviders oauth2.OpenIDPCfg) (ld *models.LoginDetails, apiErr *CodedAPIError) {
 	loginStrategy := models.LoginDetailsLoginStrategyForm
 	var redirectRules []*models.RedirectRule
 
-	loginDetails := &models.LoginDetails{
+	r := params.HTTPRequest
+
+	var loginDetails *models.LoginDetails
+	if len(openIDProviders) > 0 {
+		loginStrategy = models.LoginDetailsLoginStrategyRedirect
+	}
+
+	for name, provider := range openIDProviders {
+		// initialize new oauth2 client
+
+		oauth2Client, err := provider.GetOauth2Provider(name, nil, r, GetConsoleHTTPClient(getClientIP(params.HTTPRequest)))
+		if err != nil {
+			continue
+		}
+
+		// Validate user against IDP
+		identityProvider := &auth.IdentityProvider{
+			KeyFunc: provider.GetStateKeyFunc(),
+			Client:  oauth2Client,
+		}
+
+		displayName := fmt.Sprintf("Login with SSO (%s)", name)
+		serviceType := ""
+
+		if provider.DisplayName != "" {
+			displayName = provider.DisplayName
+		}
+
+		if provider.RoleArn != "" {
+			splitRoleArn := strings.Split(provider.RoleArn, ":")
+
+			if len(splitRoleArn) > 2 {
+				serviceType = splitRoleArn[2]
+			}
+		}
+
+		redirectRule := models.RedirectRule{
+			Redirect:    identityProvider.GenerateLoginURL(),
+			DisplayName: displayName,
+			ServiceType: serviceType,
+		}
+
+		redirectRules = append(redirectRules, &redirectRule)
+	}
+
+	if len(openIDProviders) > 0 && len(redirectRules) == 0 {
+		loginStrategy = models.LoginDetailsLoginStrategyForm
+		// No IDP configured fallback to username/password
+	}
+
+	loginDetails = &models.LoginDetails{
 		LoginStrategy: loginStrategy,
 		RedirectRules: redirectRules,
 		IsK8S:         isKubernetes(),
@@ -200,4 +344,198 @@ func getLoginDetailsResponse() (ld *models.LoginDetails, apiErr *CodedAPIError) 
 	}
 
 	return loginDetails, nil
+}
+
+func verifyTotpChallengeResponse(ctx context.Context, lr *models.LoginRequest, sessionFeatures *auth.SessionFeatures) (*models.LoginResponse, *CodedAPIError) {
+	if !totpStore.Enabled() {
+		return nil, customLoginAPIError(http.StatusBadRequest, "two-step verification is disabled")
+	}
+
+	if lr.TotpPasscode == "" {
+		return nil, customLoginAPIError(http.StatusBadRequest, "verification code is required")
+	}
+
+	claims, err := auth.SessionTokenAuthenticate(lr.TotpChallenge)
+	if err != nil || claims == nil || !claims.TOTPPending {
+		return nil, customLoginAPIError(http.StatusUnauthorized, "invalid verification challenge")
+	}
+
+	if claims.TOTPExpiresAt > 0 && time.Now().Unix() > claims.TOTPExpiresAt {
+		return nil, customLoginAPIError(http.StatusUnauthorized, "verification challenge expired")
+	}
+
+	accountAccessKey := strings.TrimSpace(claims.AccountAccessKey)
+	if accountAccessKey == "" {
+		return nil, customLoginAPIError(http.StatusUnauthorized, "invalid verification challenge")
+	}
+
+	record, ok, err := totpStore.DefaultStore().Get(accountAccessKey)
+	if err != nil {
+		return nil, ErrorWithContext(ctx, err)
+	}
+	if !ok {
+		return nil, customLoginAPIError(http.StatusUnauthorized, "two-step verification is not configured for this account")
+	}
+
+	key, err := otp.NewKeyFromURL(record.URL)
+	if err != nil {
+		return nil, ErrorWithContext(ctx, err)
+	}
+
+	valid, validateErr := totp.ValidateCustom(lr.TotpPasscode, key.Secret(), time.Now().UTC(), totp.ValidateOpts{
+		Period:    30,
+		Skew:      1,
+		Digits:    otp.DigitsSix,
+		Algorithm: otp.AlgorithmSHA1,
+	})
+	if validateErr != nil {
+		return nil, ErrorWithContext(ctx, validateErr)
+	}
+	if !valid {
+		return nil, customLoginAPIError(http.StatusUnauthorized, "invalid verification code")
+	}
+
+	if !record.Verified {
+		if err = totpStore.DefaultStore().MarkVerified(accountAccessKey); err != nil {
+			return nil, ErrorWithContext(ctx, err)
+		}
+	}
+
+	finalToken, err := auth.NewEncryptedTokenForClient(&credentials.Value{
+		AccessKeyID:     claims.STSAccessKeyID,
+		SecretAccessKey: claims.STSSecretAccessKey,
+		SessionToken:    claims.STSSessionToken,
+	}, claims.AccountAccessKey, sessionFeaturesFromClaims(claims, sessionFeatures))
+	if err != nil {
+		return nil, ErrorWithContext(ctx, err, ErrInvalidLogin)
+	}
+
+	return &models.LoginResponse{SessionID: finalToken}, nil
+}
+
+func sessionFeaturesFromClaims(claims *auth.TokenClaims, sessionFeatures *auth.SessionFeatures) *auth.SessionFeatures {
+	if sessionFeatures != nil {
+		return sessionFeatures
+	}
+
+	return &auth.SessionFeatures{
+		HideMenu:      claims.HideMenu,
+		ObjectBrowser: claims.ObjectBrowser,
+		CustomStyleOB: claims.CustomStyleOB,
+	}
+}
+
+func buildTotpSetupResponse(record totpStore.Record) (totpSetupResponse, error) {
+	key, err := otp.NewKeyFromURL(record.URL)
+	if err != nil {
+		return totpSetupResponse{}, err
+	}
+
+	image, err := key.Image(256, 256)
+	if err != nil {
+		return totpSetupResponse{}, err
+	}
+
+	var buf bytes.Buffer
+	if err = png.Encode(&buf, image); err != nil {
+		return totpSetupResponse{}, err
+	}
+
+	return totpSetupResponse{
+		Secret:      key.Secret(),
+		Issuer:      key.Issuer(),
+		AccountName: key.AccountName(),
+		QRCode:      "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()),
+	}, nil
+}
+
+func customLoginAPIError(code int, message string) *CodedAPIError {
+	return &CodedAPIError{
+		Code: code,
+		APIError: &models.APIError{
+			Message:         message,
+			DetailedMessage: "",
+		},
+	}
+}
+
+func writeJSONResponse(w http.ResponseWriter, statusCode int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// verifyUserAgainstIDP will verify user identity against the configured IDP and return MinIO credentials
+func verifyUserAgainstIDP(ctx context.Context, provider auth.IdentityProviderI, code, state string) (*credentials.Credentials, error) {
+	userCredentials, err := provider.VerifyIdentity(ctx, code, state)
+	if err != nil {
+		LogError("error validating user identity against idp: %v", err)
+		return nil, err
+	}
+	return userCredentials, nil
+}
+
+func getLoginOauth2AuthResponse(params authApi.LoginOauth2AuthParams, openIDProviders oauth2.OpenIDPCfg) (*models.LoginResponse, *CodedAPIError) {
+	ctx, cancel := context.WithCancel(params.HTTPRequest.Context())
+	defer cancel()
+	r := params.HTTPRequest
+	lr := params.Body
+
+	client := GetConsoleHTTPClient(getClientIP(params.HTTPRequest))
+	if len(openIDProviders) > 0 {
+		// we read state
+		rState := *lr.State
+
+		decodedRState, err := base64.StdEncoding.DecodeString(rState)
+		if err != nil {
+			return nil, ErrorWithContext(ctx, err)
+		}
+
+		var requestItems oauth2.LoginURLParams
+		if err = json.Unmarshal(decodedRState, &requestItems); err != nil {
+			return nil, ErrorWithContext(ctx, err)
+		}
+
+		IDPName := requestItems.IDPName
+		state := requestItems.State
+
+		providerCfg, ok := openIDProviders[IDPName]
+		if !ok {
+			return nil, ErrorWithContext(ctx, fmt.Errorf("selected IDP %s does not exist", IDPName))
+		}
+
+		// Initialize new identity provider with new oauth2Client per IDPName
+		oauth2Client, err := providerCfg.GetOauth2Provider(IDPName, nil, r, client)
+		if err != nil {
+			return nil, ErrorWithContext(ctx, err)
+		}
+
+		identityProvider := auth.IdentityProvider{
+			KeyFunc: providerCfg.GetStateKeyFunc(),
+			Client:  oauth2Client,
+			RoleARN: providerCfg.RoleArn,
+		}
+		// Validate user against IDP
+		userCredentials, err := verifyUserAgainstIDP(ctx, identityProvider, *lr.Code, state)
+		if err != nil {
+			return nil, ErrorWithContext(ctx, err)
+		}
+		// initialize admin client
+		// login user against console and generate session token
+		token, err := login(&ConsoleCredentials{
+			ConsoleCredentials: userCredentials,
+			AccountAccessKey:   "",
+			CredContext:        &credentials.CredContext{Client: client},
+		}, nil)
+		if err != nil {
+			return nil, ErrorWithContext(ctx, err)
+		}
+		// serialize output
+		loginResponse := &models.LoginResponse{
+			SessionID:       *token,
+			IDPRefreshToken: identityProvider.Client.RefreshToken,
+		}
+		return loginResponse, nil
+	}
+	return nil, ErrorWithContext(ctx, ErrDefault)
 }
