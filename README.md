@@ -1,4 +1,4 @@
-# MinIO Console
+<p align="center"># MinIO Custom Interface</p>
 
 <p align="center">
   <img src="images/minio.png" alt="MinIO" width="220">
