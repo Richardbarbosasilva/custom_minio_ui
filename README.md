@@ -1,6 +1,6 @@
 # MinIO Console
 
-![build](https://github.com/minio/object-browser/actions/workflows/jobs.yaml/badge.svg) ![license](https://img.shields.io/badge/license-AGPL%20V3-blue)
+![build](images/minio.png) ![license](https://img.shields.io/badge/license-AGPL%20V3-blue)
 
 A graphical user interface for [MinIO](https://github.com/minio/minio)
 
