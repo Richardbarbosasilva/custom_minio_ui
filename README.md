@@ -1,7 +1,7 @@
 # MinIO Console
 
 <p align="left">
-  <img src="images/minio.svg" alt="MinIO" width="220">
+  <img src="images/minio.png" alt="MinIO" width="220">
 </p> ![license](https://img.shields.io/badge/license-AGPL%20V3-blue)
 
 A graphical user interface for [MinIO](https://github.com/minio/minio)
